@@ -218,6 +218,13 @@ export const createClusterContext = (session) => {
     throw new Error('未从 sdk session 中解析到 user.id，无法生成 agent.sealos.io/name label')
   }
 
+  console.info('[k8s-api] cluster context parsed', {
+    namespace,
+    server,
+    tokenFromKubeconfig: maskTokenForLog(token),
+    tokenFromSession: maskTokenForLog(sessionToken),
+  })
+
   return {
     server,
     namespace,
@@ -256,6 +263,22 @@ const getAuthTokenCandidates = (clusterContext) => {
     seen.add(entry.token)
     return true
   })
+}
+
+function maskTokenForLog(token = '') {
+  if (!token || typeof token !== 'string') {
+    return {
+      length: 0,
+      head: '',
+      tail: '',
+    }
+  }
+
+  return {
+    length: token.length,
+    head: token.slice(0, 10),
+    tail: token.slice(-10),
+  }
 }
 
 const isUnauthorizedError = (error) => error?.status === 401
