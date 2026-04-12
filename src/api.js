@@ -67,6 +67,12 @@ const toKubeconfigScalar = (value) => {
   return value.trim().replace(/^['"]|['"]$/g, '')
 }
 
+const normalizeK8sToken = (value) => {
+  const token = toKubeconfigScalar(value)
+  if (!token) return ''
+  return token.replace(/\s+/g, '')
+}
+
 const parseKubeconfigStruct = (kubeconfig = '') => {
   if (!kubeconfig) return {}
 
@@ -88,13 +94,10 @@ const parseKubeconfigStruct = (kubeconfig = '') => {
 
     return {
       namespace,
-      token: toKubeconfigScalar(selectedUser?.user?.token),
+      token: normalizeK8sToken(selectedUser?.user?.token),
       server: toKubeconfigScalar(selectedCluster?.cluster?.server),
     }
-  } catch (error) {
-    console.warn('[k8s-api] parse kubeconfig with yaml failed, fallback to line parser', {
-      message: error?.message,
-    })
+  } catch {
     return {}
   }
 }
@@ -114,7 +117,8 @@ const parseKubeconfigValue = (kubeconfig = '', key) => {
     const rawValue = (match[2] || '').trim()
 
     if (rawValue && !['>-', '>', '|-', '|'].includes(rawValue)) {
-      return rawValue.replace(/^['"]|['"]$/g, '')
+      const scalar = rawValue.replace(/^['"]|['"]$/g, '')
+      return key === 'token' ? normalizeK8sToken(scalar) : scalar
     }
 
     const blockLines = []
@@ -131,7 +135,8 @@ const parseKubeconfigValue = (kubeconfig = '', key) => {
     }
 
     if (blockLines.length) {
-      return blockLines.join('')
+      const blockValue = blockLines.join('')
+      return key === 'token' ? normalizeK8sToken(blockValue) : blockValue
     }
 
     return ''
@@ -146,13 +151,34 @@ const getNow = () => {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
+const parseErrorPayload = (text = '') => {
+  if (!text) return { message: '', reason: '', code: '' }
+  try {
+    const parsed = JSON.parse(text)
+    return {
+      message: parsed?.message || '',
+      reason: parsed?.reason || '',
+      code: parsed?.code || '',
+    }
+  } catch {
+    return { message: text, reason: '', code: '' }
+  }
+}
+
 const requestJson = async (url, options = {}) => {
   const response = await fetch(url, options)
   if (!response.ok) {
     const text = await response.text().catch(() => '')
-    const error = new Error(text || `请求失败: ${response.status}`)
+    const payloadMeta = parseErrorPayload(text)
+    const error = new Error(payloadMeta.message || text || `请求失败: ${response.status}`)
     error.status = response.status
     error.payload = text
+    error.payloadMessage = payloadMeta.message
+    error.payloadReason = payloadMeta.reason
+    error.payloadCode = payloadMeta.code
+    error.auditId = response.headers.get('audit-id') || ''
+    error.wwwAuthenticate = response.headers.get('www-authenticate') || ''
+    error.contentType = response.headers.get('content-type') || ''
     throw error
   }
 
@@ -165,9 +191,16 @@ const requestJson = async (url, options = {}) => {
 
 const createApiError = async (response) => {
   const text = await response.text().catch(() => '')
-  const error = new Error(text || `请求失败: ${response.status}`)
+  const payloadMeta = parseErrorPayload(text)
+  const error = new Error(payloadMeta.message || text || `请求失败: ${response.status}`)
   error.status = response.status
   error.payload = text
+  error.payloadMessage = payloadMeta.message
+  error.payloadReason = payloadMeta.reason
+  error.payloadCode = payloadMeta.code
+  error.auditId = response.headers.get('audit-id') || ''
+  error.wwwAuthenticate = response.headers.get('www-authenticate') || ''
+  error.contentType = response.headers.get('content-type') || ''
   return error
 }
 
@@ -195,9 +228,19 @@ const requestMaybeConflict = async (url, options = {}) => {
 export const createClusterContext = (session) => {
   const kubeconfig = session?.kubeconfig || ''
   const parsedKubeconfig = parseKubeconfigStruct(kubeconfig)
-  const server = parsedKubeconfig.server || parseKubeconfigValue(kubeconfig, 'server')
-  const namespace = parsedKubeconfig.namespace || parseKubeconfigValue(kubeconfig, 'namespace')
-  const token = parsedKubeconfig.token || parseKubeconfigValue(kubeconfig, 'token')
+
+  const parsedServer = parsedKubeconfig.server || ''
+  const fallbackServer = parseKubeconfigValue(kubeconfig, 'server')
+  const server = parsedServer || fallbackServer
+
+  const parsedNamespace = parsedKubeconfig.namespace || ''
+  const fallbackNamespace = parseKubeconfigValue(kubeconfig, 'namespace')
+  const namespace = parsedNamespace || fallbackNamespace
+
+  const parsedToken = normalizeK8sToken(parsedKubeconfig.token || '')
+  const fallbackToken = normalizeK8sToken(parseKubeconfigValue(kubeconfig, 'token'))
+  const token = normalizeK8sToken(parsedToken || fallbackToken)
+
   const sessionToken = session?.token || ''
   const operator = session?.user?.id || session?.user?.name || ''
   const agentLabel = operator
@@ -210,20 +253,13 @@ export const createClusterContext = (session) => {
     throw new Error('未从 sdk session 中解析到 namespace')
   }
 
-  if (!token && !sessionToken) {
-    throw new Error('未从 sdk session / kubeconfig 中解析到可用 token')
+  if (!token) {
+    throw new Error('未从 sdk session / kubeconfig 中解析到 kubeconfig token')
   }
 
   if (!agentLabel) {
     throw new Error('未从 sdk session 中解析到 user.id，无法生成 agent.sealos.io/name label')
   }
-
-  console.info('[k8s-api] cluster context parsed', {
-    namespace,
-    server,
-    tokenFromKubeconfig: maskTokenForLog(token),
-    tokenFromSession: maskTokenForLog(sessionToken),
-  })
 
   return {
     server,
@@ -237,7 +273,7 @@ export const createClusterContext = (session) => {
 }
 
 const buildHeaders = (clusterContext, tokenOverride = '') => {
-  const authToken = tokenOverride || clusterContext.token || clusterContext.sessionToken || ''
+  const authToken = tokenOverride || clusterContext.token || ''
   const headers = {
     Authorization: `Bearer ${authToken}`,
     Accept: 'application/json',
@@ -252,10 +288,7 @@ const buildHeaders = (clusterContext, tokenOverride = '') => {
 }
 
 const getAuthTokenCandidates = (clusterContext) => {
-  const entries = [
-    { source: 'kubeconfig', token: clusterContext.token },
-    { source: 'session', token: clusterContext.sessionToken },
-  ].filter((entry) => Boolean(entry.token))
+  const entries = [{ source: 'kubeconfig', token: clusterContext.token }].filter((entry) => Boolean(entry.token))
 
   const seen = new Set()
   return entries.filter((entry) => {
@@ -263,22 +296,6 @@ const getAuthTokenCandidates = (clusterContext) => {
     seen.add(entry.token)
     return true
   })
-}
-
-function maskTokenForLog(token = '') {
-  if (!token || typeof token !== 'string') {
-    return {
-      length: 0,
-      head: '',
-      tail: '',
-    }
-  }
-
-  return {
-    length: token.length,
-    head: token.slice(0, 10),
-    tail: token.slice(-10),
-  }
 }
 
 const isUnauthorizedError = (error) => error?.status === 401
@@ -298,10 +315,6 @@ const requestJsonWithAuthRetry = async (url, clusterContext, options = {}) => {
       if (!isUnauthorizedError(error)) {
         throw error
       }
-      console.warn(`[k8s-api] ${candidate.source} token unauthorized, retry next candidate`, {
-        status: error.status,
-        url,
-      })
     }
   }
 
@@ -323,10 +336,6 @@ const requestMaybeConflictWithAuthRetry = async (url, clusterContext, options = 
       if (!isUnauthorizedError(error)) {
         throw error
       }
-      console.warn(`[k8s-api] ${candidate.source} token unauthorized, retry next candidate`, {
-        status: error.status,
-        url,
-      })
     }
   }
 
@@ -731,11 +740,12 @@ export const getCreateBlueprint = (clusterContext, hostConfig) => {
   const appName = createAppName()
   const domainPrefix = createDomainPrefix()
   const apiKey = createApiKey()
-  const regionDomain =
+  const rawRegionDomain =
     sessionStorage.getItem('hermes-region-domain') ||
     hostConfig?.cloud?.domain ||
     hostConfig?.domain ||
     'usw-1.sealos.app'
+  const regionDomain = String(rawRegionDomain || '').trim().replace(/\.sealos\.io$/i, '.sealos.app') || 'usw-1.sealos.app'
 
   return {
     appName,

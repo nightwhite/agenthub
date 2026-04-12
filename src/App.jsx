@@ -17,7 +17,6 @@ import {
   getSealosHostConfig,
   getSealosLanguage,
   getSealosQuota,
-  getSealosSdkDebugInfo,
   getSealosSession,
 } from './sealosSdk'
 import { CHAT_TRANSPORT, createOpenAIChatConnection } from './chat'
@@ -385,43 +384,22 @@ export default function App() {
   const loadAll = async () => {
     setLoading(true)
     try {
-      const session = await getSealosSession().catch((error) => {
-        console.warn('[sealos-sdk] getSession failed', error)
-        return null
-      })
-      const language = await getSealosLanguage().catch((error) => {
-        console.warn('[sealos-sdk] getLanguage failed', error)
-        return null
-      })
-      const quota = await getSealosQuota().catch((error) => {
-        console.warn('[sealos-sdk] getWorkspaceQuota failed', error)
-        return null
-      })
-      const hostConfig = await getSealosHostConfig().catch((error) => {
-        console.warn('[sealos-sdk] getHostConfig failed', error)
-        return null
-      })
+      const session = await getSealosSession().catch(() => null)
+      const language = await getSealosLanguage().catch(() => null)
+      const quota = await getSealosQuota().catch(() => null)
+      const hostConfig = await getSealosHostConfig().catch(() => null)
 
       setHostConfig(hostConfig)
 
-      const sdkDebugInfo = getSealosSdkDebugInfo()
-      console.groupCollapsed('[sealos-sdk] runtime info')
-      console.log('sdkDebugInfo', sdkDebugInfo)
-      console.log('session', session)
-      console.log('language', language)
-      console.log('quota', quota)
-      console.log('hostConfig', hostConfig)
-      console.groupEnd()
-
       const nextClusterContext = createClusterContext(session)
       setClusterContext(nextClusterContext)
-
 
       const kubeconfig = session?.kubeconfig || ''
       if (kubeconfig) {
         sessionStorage.setItem('hermes-kubeconfig', kubeconfig)
       }
-      const regionDomain = hostConfig?.cloud?.domain || hostConfig?.domain || session?.subscription?.RegionDomain || ''
+      const rawRegionDomain = session?.subscription?.RegionDomain || hostConfig?.cloud?.domain || hostConfig?.domain || ''
+      const regionDomain = String(rawRegionDomain || '').trim().replace(/\.sealos\.io$/i, '.sealos.app')
       if (regionDomain) {
         sessionStorage.setItem('hermes-region-domain', regionDomain)
       }
@@ -432,11 +410,6 @@ export default function App() {
         listResources('service', nextClusterContext),
         listResources('ingress', nextClusterContext),
       ])
-      console.groupCollapsed('[agenthub] resource snapshot')
-      console.log('devbox', devbox)
-      console.log('service', service)
-      console.log('ingress', ingress)
-      console.groupEnd()
       setClusterInfo(cluster)
       setResources({ devbox, service, ingress })
       setMessage('已通过 fetch 同步最新数据')
@@ -1148,16 +1121,51 @@ export default function App() {
   }
 
   const handleDelete = async (item) => {
-    const confirmed = window.confirm(`确认删除 ${item.name} 吗？`)
+    const itemYaml = item?.yaml || {}
+    const itemLabels = itemYaml?.metadata?.labels || {}
+    const appLabel =
+      itemLabels?.app ||
+      itemYaml?.spec?.selector?.app ||
+      itemYaml?.spec?.rules?.[0]?.http?.paths?.[0]?.backend?.service?.name ||
+      item.name
+    const agentLabel = itemLabels?.['agent.sealos.io/name'] || clusterContext?.agentLabel || ''
+
+    const sameLabel = (entry) => {
+      const labels = entry?.yaml?.metadata?.labels || {}
+      if ((labels?.app || '') !== appLabel) return false
+      if (agentLabel && (labels?.['agent.sealos.io/name'] || '') !== agentLabel) return false
+      return true
+    }
+
+    const targets = [
+      ...resources.devbox.filter(sameLabel).map((entry) => ({ type: 'devbox', name: entry.name })),
+      ...resources.service.filter(sameLabel).map((entry) => ({ type: 'service', name: entry.name })),
+      ...resources.ingress.filter(sameLabel).map((entry) => ({ type: 'ingress', name: entry.name })),
+    ]
+
+    const dedupedTargets = Array.from(new Map(targets.map((target) => [`${target.type}:${target.name}`, target])).values())
+    const deleteTargets = dedupedTargets.length ? dedupedTargets : [{ type: activeType, name: item.name }]
+    const order = { ingress: 0, service: 1, devbox: 2 }
+    deleteTargets.sort((a, b) => (order[a.type] ?? 99) - (order[b.type] ?? 99))
+
+    const confirmed = window.confirm(`确认联动删除 ${deleteTargets.length} 个资源吗？`)
     if (!confirmed) return
 
     try {
-      await deleteResource(activeType, item.name, clusterContext)
-      setResources((current) => ({
-        ...current,
-        [activeType]: current[activeType].filter((entry) => entry.name !== item.name),
-      }))
-      setMessage(`${meta.title} 删除成功`)
+      const failed = []
+      for (const target of deleteTargets) {
+        try {
+          await deleteResource(target.type, target.name, clusterContext)
+        } catch (error) {
+          failed.push(`${target.type}/${target.name}: ${error?.message || '删除失败'}`)
+        }
+      }
+
+      if (failed.length) {
+        throw new Error(`部分删除失败：${failed.join('; ')}`)
+      }
+
+      setMessage(`已联动删除 ${deleteTargets.length} 个资源`)
       await loadAll()
     } catch (error) {
       setMessage(error.message || '删除失败')
