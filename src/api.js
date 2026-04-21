@@ -67,10 +67,55 @@ const toKubeconfigScalar = (value) => {
   return value.trim().replace(/^['"]|['"]$/g, '')
 }
 
-const normalizeK8sToken = (value) => {
-  const token = toKubeconfigScalar(value)
-  if (!token) return ''
-  return token.replace(/\s+/g, '')
+const encodeHeaderValue = (value = '') => {
+  if (!value) return ''
+
+  try {
+    return encodeURIComponent(value)
+  } catch {
+    return ''
+  }
+}
+
+const dedupeAuthCandidates = (entries = []) => {
+  const seen = new Set()
+
+  return entries.filter((entry) => {
+    const token = toKubeconfigScalar(entry?.token)
+    if (!token || seen.has(token)) return false
+    seen.add(token)
+    entry.token = token
+    return true
+  })
+}
+
+const extractExecEnvTokenCandidates = (envList = []) =>
+  dedupeAuthCandidates(
+    (Array.isArray(envList) ? envList : [])
+      .filter((entry) => /token/i.test(entry?.name || ''))
+      .map((entry) => ({
+        source: `kubeconfig exec env ${entry?.name || 'token'}`,
+        token: entry?.value,
+      })),
+  )
+
+const extractKubeconfigAuthCandidates = (userConfig = {}) => {
+  const authProviderConfig = userConfig?.['auth-provider']?.config || userConfig?.authProvider?.config || {}
+
+  return dedupeAuthCandidates([
+    { source: 'kubeconfig token', token: userConfig?.token },
+    { source: 'kubeconfig id-token', token: userConfig?.['id-token'] },
+    { source: 'kubeconfig access-token', token: userConfig?.['access-token'] },
+    {
+      source: 'kubeconfig auth-provider id-token',
+      token: authProviderConfig?.['id-token'] || authProviderConfig?.idToken,
+    },
+    {
+      source: 'kubeconfig auth-provider access-token',
+      token: authProviderConfig?.['access-token'] || authProviderConfig?.accessToken,
+    },
+    ...extractExecEnvTokenCandidates(userConfig?.exec?.env),
+  ])
 }
 
 const parseKubeconfigStruct = (kubeconfig = '') => {
@@ -91,22 +136,28 @@ const parseKubeconfigStruct = (kubeconfig = '') => {
 
     const selectedUser = users.find((item) => item?.name === userName) || users[0]
     const selectedCluster = clusters.find((item) => item?.name === clusterName) || clusters[0]
+    const authCandidates = extractKubeconfigAuthCandidates(selectedUser?.user || {})
 
     return {
       namespace,
-      token: normalizeK8sToken(selectedUser?.user?.token),
+      token: authCandidates[0]?.token || '',
+      authCandidates,
       server: toKubeconfigScalar(selectedCluster?.cluster?.server),
     }
-  } catch {
+  } catch (error) {
+    console.warn('[k8s-api] parse kubeconfig with yaml failed, fallback to line parser', {
+      message: error?.message,
+    })
     return {}
   }
 }
 
-const parseKubeconfigValue = (kubeconfig = '', key) => {
-  if (!kubeconfig || !key) return ''
+const parseKubeconfigValues = (kubeconfig = '', key) => {
+  if (!kubeconfig || !key) return []
 
   const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const lines = kubeconfig.split('\n')
+  const values = []
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]
@@ -117,8 +168,8 @@ const parseKubeconfigValue = (kubeconfig = '', key) => {
     const rawValue = (match[2] || '').trim()
 
     if (rawValue && !['>-', '>', '|-', '|'].includes(rawValue)) {
-      const scalar = rawValue.replace(/^['"]|['"]$/g, '')
-      return key === 'token' ? normalizeK8sToken(scalar) : scalar
+      values.push(rawValue.replace(/^['"]|['"]$/g, ''))
+      continue
     }
 
     const blockLines = []
@@ -135,15 +186,15 @@ const parseKubeconfigValue = (kubeconfig = '', key) => {
     }
 
     if (blockLines.length) {
-      const blockValue = blockLines.join('')
-      return key === 'token' ? normalizeK8sToken(blockValue) : blockValue
+      values.push(blockLines.join(''))
+      continue
     }
-
-    return ''
   }
 
-  return ''
+  return values
 }
+
+const parseKubeconfigValue = (kubeconfig = '', key) => parseKubeconfigValues(kubeconfig, key)[0] || ''
 
 const getNow = () => {
   const date = new Date()
@@ -151,34 +202,13 @@ const getNow = () => {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
-const parseErrorPayload = (text = '') => {
-  if (!text) return { message: '', reason: '', code: '' }
-  try {
-    const parsed = JSON.parse(text)
-    return {
-      message: parsed?.message || '',
-      reason: parsed?.reason || '',
-      code: parsed?.code || '',
-    }
-  } catch {
-    return { message: text, reason: '', code: '' }
-  }
-}
-
 const requestJson = async (url, options = {}) => {
   const response = await fetch(url, options)
   if (!response.ok) {
     const text = await response.text().catch(() => '')
-    const payloadMeta = parseErrorPayload(text)
-    const error = new Error(payloadMeta.message || text || `请求失败: ${response.status}`)
+    const error = new Error(text || `请求失败: ${response.status}`)
     error.status = response.status
     error.payload = text
-    error.payloadMessage = payloadMeta.message
-    error.payloadReason = payloadMeta.reason
-    error.payloadCode = payloadMeta.code
-    error.auditId = response.headers.get('audit-id') || ''
-    error.wwwAuthenticate = response.headers.get('www-authenticate') || ''
-    error.contentType = response.headers.get('content-type') || ''
     throw error
   }
 
@@ -191,16 +221,21 @@ const requestJson = async (url, options = {}) => {
 
 const createApiError = async (response) => {
   const text = await response.text().catch(() => '')
-  const payloadMeta = parseErrorPayload(text)
-  const error = new Error(payloadMeta.message || text || `请求失败: ${response.status}`)
+  let payload = text
+  let message = text || `请求失败: ${response.status}`
+
+  if (text) {
+    try {
+      payload = JSON.parse(text)
+      message = payload?.message || message
+    } catch {
+      payload = text
+    }
+  }
+
+  const error = new Error(message)
   error.status = response.status
-  error.payload = text
-  error.payloadMessage = payloadMeta.message
-  error.payloadReason = payloadMeta.reason
-  error.payloadCode = payloadMeta.code
-  error.auditId = response.headers.get('audit-id') || ''
-  error.wwwAuthenticate = response.headers.get('www-authenticate') || ''
-  error.contentType = response.headers.get('content-type') || ''
+  error.payload = payload
   return error
 }
 
@@ -225,23 +260,94 @@ const requestMaybeConflict = async (url, options = {}) => {
   }
 }
 
+const requestRawWithAuthRetry = async (url, clusterContext, options = {}) => {
+  try {
+    const response = await fetch(url, buildAuthorizedRequestOptions(clusterContext, options))
+    if (!response.ok) {
+      throw await createApiError(response)
+    }
+    return response
+  } catch (error) {
+    if (isUnauthorizedError(error)) {
+      error.message = '请求失败: kubeconfig 认证无效或当前环境未按 Sealos 应用方式代理 Kubernetes 请求'
+    }
+    throw error
+  }
+}
+
+const fileToBase64 = (file) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = String(reader.result || '')
+      const marker = 'base64,'
+      const index = result.indexOf(marker)
+      resolve(index >= 0 ? result.slice(index + marker.length) : '')
+    }
+    reader.onerror = () => reject(reader.error || new Error('读取文件失败'))
+    reader.readAsDataURL(file)
+  })
+
+const bytesToBase64 = (bytes = new Uint8Array()) => {
+  let binary = ''
+  const chunkSize = 0x8000
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize)
+    binary += String.fromCharCode(...chunk)
+  }
+
+  return btoa(binary)
+}
+
+const textToBase64 = (value = '') => bytesToBase64(new TextEncoder().encode(String(value || '')))
+
+const base64ToText = (value = '') => {
+  if (!value) return ''
+  const binary = atob(value)
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
+}
+
+const parseContentDispositionFilename = (value = '') => {
+  if (!value) return ''
+
+  const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i)
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1])
+    } catch {
+      return utf8Match[1]
+    }
+  }
+
+  const asciiMatch = value.match(/filename="?([^";]+)"?/i)
+  return asciiMatch?.[1] || ''
+}
+
 export const createClusterContext = (session) => {
   const kubeconfig = session?.kubeconfig || ''
   const parsedKubeconfig = parseKubeconfigStruct(kubeconfig)
-
-  const parsedServer = parsedKubeconfig.server || ''
-  const fallbackServer = parseKubeconfigValue(kubeconfig, 'server')
-  const server = parsedServer || fallbackServer
-
-  const parsedNamespace = parsedKubeconfig.namespace || ''
-  const fallbackNamespace = parseKubeconfigValue(kubeconfig, 'namespace')
-  const namespace = parsedNamespace || fallbackNamespace
-
-  const parsedToken = normalizeK8sToken(parsedKubeconfig.token || '')
-  const fallbackToken = normalizeK8sToken(parseKubeconfigValue(kubeconfig, 'token'))
-  const token = normalizeK8sToken(parsedToken || fallbackToken)
-
-  const sessionToken = session?.token || ''
+  const server = parsedKubeconfig.server || parseKubeconfigValue(kubeconfig, 'server')
+  const namespace = parsedKubeconfig.namespace || parseKubeconfigValue(kubeconfig, 'namespace')
+  const sessionToken = toKubeconfigScalar(session?.token)
+  const authCandidates = dedupeAuthCandidates([
+    ...(parsedKubeconfig.authCandidates || []),
+    ...parseKubeconfigValues(kubeconfig, 'token').map((token) => ({
+      source: 'kubeconfig token (line fallback)',
+      token,
+    })),
+    ...parseKubeconfigValues(kubeconfig, 'id-token').map((token) => ({
+      source: 'kubeconfig id-token (line fallback)',
+      token,
+    })),
+    ...parseKubeconfigValues(kubeconfig, 'access-token').map((token) => ({
+      source: 'kubeconfig access-token (line fallback)',
+      token,
+    })),
+    { source: 'session token', token: sessionToken },
+  ])
+  const token = parsedKubeconfig.token || authCandidates[0]?.token || ''
   const operator = session?.user?.id || session?.user?.name || ''
   const agentLabel = operator
 
@@ -253,98 +359,212 @@ export const createClusterContext = (session) => {
     throw new Error('未从 sdk session 中解析到 namespace')
   }
 
-  if (!token) {
-    throw new Error('未从 sdk session / kubeconfig 中解析到 kubeconfig token')
+  if (!authCandidates.length) {
+    throw new Error('未从 sdk session / kubeconfig 中解析到可用 token')
   }
 
   if (!agentLabel) {
     throw new Error('未从 sdk session 中解析到 user.id，无法生成 agent.sealos.io/name label')
   }
 
+  console.info('[k8s-api] cluster context parsed', {
+    namespace,
+    server,
+    tokenFromKubeconfig: maskTokenForLog(token),
+    tokenFromSession: maskTokenForLog(sessionToken),
+    authSources: authCandidates.map((candidate) => candidate.source),
+  })
+
   return {
     server,
     namespace,
     token,
     sessionToken,
+    authCandidates,
+    activeAuthToken: '',
+    activeAuthSource: '',
     operator,
     agentLabel,
     kubeconfig,
   }
 }
 
-const buildHeaders = (clusterContext, tokenOverride = '') => {
-  const authToken = tokenOverride || clusterContext.token || ''
+export const getPreferredAuthToken = (clusterContext) =>
+  toKubeconfigScalar(
+    clusterContext?.activeAuthToken ||
+      clusterContext?.authCandidates?.[0]?.token ||
+      clusterContext?.token ||
+      clusterContext?.sessionToken,
+  )
+
+const buildHeaders = (clusterContext) => {
+  const encodedKubeconfig = encodeHeaderValue(clusterContext?.kubeconfig || '')
+  const encodedDesktopToken = encodeHeaderValue(clusterContext?.sessionToken || '')
   const headers = {
-    Authorization: `Bearer ${authToken}`,
     Accept: 'application/json',
     'Content-Type': 'application/json',
   }
 
-  if (clusterContext.server) {
-    headers['X-K8s-Server'] = clusterContext.server
+  if (encodedKubeconfig) {
+    headers.Authorization = encodedKubeconfig
+  }
+
+  if (encodedDesktopToken) {
+    headers['Authorization-Bearer'] = encodedDesktopToken
   }
 
   return headers
 }
 
-const getAuthTokenCandidates = (clusterContext) => {
-  const entries = [{ source: 'kubeconfig', token: clusterContext.token }].filter((entry) => Boolean(entry.token))
+function maskTokenForLog(token = '') {
+  if (!token || typeof token !== 'string') {
+    return {
+      length: 0,
+      head: '',
+      tail: '',
+    }
+  }
 
-  const seen = new Set()
-  return entries.filter((entry) => {
-    if (seen.has(entry.token)) return false
-    seen.add(entry.token)
-    return true
-  })
+  return {
+    length: token.length,
+    head: token.slice(0, 10),
+    tail: token.slice(-10),
+  }
 }
 
 const isUnauthorizedError = (error) => error?.status === 401
 
+const buildAuthorizedRequestOptions = (clusterContext, options = {}) => ({
+  ...options,
+  headers: {
+    ...(options.headers || {}),
+    ...buildHeaders(clusterContext),
+  },
+})
+
 const requestJsonWithAuthRetry = async (url, clusterContext, options = {}) => {
-  const tokenCandidates = getAuthTokenCandidates(clusterContext)
-  let lastError = null
-
-  for (const candidate of tokenCandidates) {
-    try {
-      return await requestJson(url, {
-        ...options,
-        headers: buildHeaders(clusterContext, candidate.token),
-      })
-    } catch (error) {
-      lastError = error
-      if (!isUnauthorizedError(error)) {
-        throw error
-      }
+  try {
+    return await requestJson(url, buildAuthorizedRequestOptions(clusterContext, options))
+  } catch (error) {
+    if (isUnauthorizedError(error)) {
+      error.message = '请求失败: kubeconfig 认证无效或当前环境未按 Sealos 应用方式代理 Kubernetes 请求'
     }
+    throw error
   }
-
-  throw lastError || new Error('请求失败: 未找到可用认证 token')
 }
 
 const requestMaybeConflictWithAuthRetry = async (url, clusterContext, options = {}) => {
-  const tokenCandidates = getAuthTokenCandidates(clusterContext)
-  let lastError = null
-
-  for (const candidate of tokenCandidates) {
-    try {
-      return await requestMaybeConflict(url, {
-        ...options,
-        headers: buildHeaders(clusterContext, candidate.token),
-      })
-    } catch (error) {
-      lastError = error
-      if (!isUnauthorizedError(error)) {
-        throw error
-      }
+  try {
+    return await requestMaybeConflict(url, buildAuthorizedRequestOptions(clusterContext, options))
+  } catch (error) {
+    if (isUnauthorizedError(error)) {
+      error.message = '请求失败: kubeconfig 认证无效或当前环境未按 Sealos 应用方式代理 Kubernetes 请求'
     }
+    throw error
   }
-
-  throw lastError || new Error('请求失败: 未找到可用认证 token')
 }
 
 const buildProxyUrl = (path, searchParams) => {
   const query = searchParams?.toString()
   return `/k8s-api${path}${query ? `?${query}` : ''}`
+}
+
+const normalizeHostname = (value = '') => {
+  if (!value || typeof value !== 'string') return ''
+
+  const raw = value.trim()
+  if (!raw) return ''
+
+  try {
+    const target = raw.includes('://') ? new URL(raw) : new URL(`https://${raw}`)
+    return target.hostname.trim().toLowerCase().replace(/\.$/, '')
+  } catch {
+    return raw
+      .replace(/^[a-z]+:\/\//i, '')
+      .replace(/\/.*$/, '')
+      .replace(/:\d+$/, '')
+      .trim()
+      .toLowerCase()
+      .replace(/\.$/, '')
+  }
+}
+
+const dedupeStrings = (values = []) => {
+  const seen = new Set()
+
+  return values.filter((value) => {
+    const normalized = normalizeHostname(value)
+    if (!normalized || seen.has(normalized)) return false
+    seen.add(normalized)
+    return true
+  })
+}
+
+const deriveRegionSlug = (value = '') => {
+  const hostname = normalizeHostname(value)
+  const firstLabel = hostname.split('.').filter(Boolean)[0] || ''
+
+  return firstLabel.replace(/-\d+$/, '').replace(/[^a-z0-9]/g, '')
+}
+
+const deriveIngressDomainFromRegion = (value = '') => {
+  const hostname = normalizeHostname(value)
+  if (!hostname) return ''
+
+  if (/\.sealos\.app$/i.test(hostname)) {
+    return hostname
+  }
+
+  if (/\.sealos\.io$/i.test(hostname)) {
+    return hostname.replace(/\.sealos\.io$/i, '.sealos.app')
+  }
+
+  const slug = deriveRegionSlug(hostname)
+  return slug ? `${slug}.sealos.app` : ''
+}
+
+const inferIngressDomainFromExistingIngresses = (ingressList = []) => {
+  for (const ingress of Array.isArray(ingressList) ? ingressList : []) {
+    const host = normalizeHostname(ingress?.yaml?.spec?.rules?.[0]?.host || ingress?.desc || '')
+    const publicDomainLabel = normalizeHostname(
+      ingress?.yaml?.metadata?.labels?.['cloud.sealos.io/app-deploy-manager-domain'] || '',
+    )
+
+    if (publicDomainLabel && !publicDomainLabel.includes('.') && host.startsWith(`${publicDomainLabel}.`)) {
+      return host.slice(publicDomainLabel.length + 1)
+    }
+
+    const parts = host.split('.').filter(Boolean)
+    if (parts.length >= 3 && /^sealos[a-z0-9-]+\.(site|run|io|plus)$/.test(parts.slice(1).join('.'))) {
+      return parts.slice(1).join('.')
+    }
+  }
+
+  return ''
+}
+
+const resolveIngressDomain = (hostConfig, ingressList = []) => {
+  const storedIngressDomain =
+    typeof window !== 'undefined' ? sessionStorage.getItem('hermes-ingress-domain') || '' : ''
+  const storedRegionDomain =
+    typeof window !== 'undefined' ? sessionStorage.getItem('hermes-region-domain') || '' : ''
+
+  const candidates = dedupeStrings([
+    storedIngressDomain,
+    inferIngressDomainFromExistingIngresses(ingressList),
+    import.meta.env.VITE_DEFAULT_INGRESS_DOMAIN || '',
+    deriveIngressDomainFromRegion(storedRegionDomain),
+    deriveIngressDomainFromRegion(hostConfig?.cloud?.domain),
+    deriveIngressDomainFromRegion(hostConfig?.domain),
+  ])
+
+  const resolved = candidates[0] || ''
+
+  if (resolved && typeof window !== 'undefined') {
+    sessionStorage.setItem('hermes-ingress-domain', resolved)
+  }
+
+  return resolved
 }
 
 export const findExecPodForApp = async (appName, clusterContext) => {
@@ -466,6 +686,10 @@ export const buildPodExecWsCandidates = ({
 
   if (token) {
     params.set('k8sToken', token)
+  }
+
+  if (clusterServer) {
+    params.set('k8sServer', clusterServer)
   }
 
   const query = params.toString()
@@ -725,34 +949,176 @@ export const deleteResource = async (type, name, clusterContext) => {
   return true
 }
 
+export const uploadFileToPod = async ({ appName, file, targetDirectory }, clusterContext) => {
+  if (!appName) {
+    throw new Error('缺少应用名，无法上传文件')
+  }
+  if (!file) {
+    throw new Error('请先选择要上传的文件')
+  }
+
+  const pod = await findExecPodForApp(appName, clusterContext)
+  const contentBase64 = await fileToBase64(file)
+  const response = await requestJsonWithAuthRetry(buildProxyUrl('/files/upload'), clusterContext, {
+    method: 'POST',
+    body: JSON.stringify({
+      namespace: pod.namespace,
+      podName: pod.podName,
+      containerName: pod.containerName,
+      targetDirectory,
+      fileName: file.name,
+      contentBase64,
+    }),
+  })
+
+  return {
+    ...response,
+    podName: pod.podName,
+    containerName: pod.containerName,
+  }
+}
+
+export const downloadFileFromPod = async ({ appName, remotePath }, clusterContext) => {
+  if (!appName) {
+    throw new Error('缺少应用名，无法下载文件')
+  }
+  if (!remotePath) {
+    throw new Error('请输入容器内文件路径')
+  }
+
+  const pod = await findExecPodForApp(appName, clusterContext)
+  const response = await requestRawWithAuthRetry(buildProxyUrl('/files/download'), clusterContext, {
+    method: 'POST',
+    body: JSON.stringify({
+      namespace: pod.namespace,
+      podName: pod.podName,
+      containerName: pod.containerName,
+      remotePath,
+    }),
+  })
+
+  return {
+    blob: await response.blob(),
+    fileName:
+      parseContentDispositionFilename(response.headers.get('content-disposition') || '') ||
+      remotePath.split('/').filter(Boolean).pop() ||
+      `${appName}.dat`,
+    podName: pod.podName,
+    containerName: pod.containerName,
+  }
+}
+
+export const listFilesInPod = async ({ appName, directory }, clusterContext) => {
+  if (!appName) {
+    throw new Error('缺少应用名，无法读取目录')
+  }
+
+  const pod = await findExecPodForApp(appName, clusterContext)
+  const response = await requestJsonWithAuthRetry(buildProxyUrl('/files/list'), clusterContext, {
+    method: 'POST',
+    body: JSON.stringify({
+      namespace: pod.namespace,
+      podName: pod.podName,
+      containerName: pod.containerName,
+      directory,
+    }),
+  })
+
+  return {
+    ...response,
+    podName: pod.podName,
+    containerName: pod.containerName,
+  }
+}
+
+export const readFileFromPod = async ({ appName, remotePath }, clusterContext) => {
+  if (!appName) {
+    throw new Error('缺少应用名，无法读取文件')
+  }
+  if (!remotePath) {
+    throw new Error('缺少文件路径，无法读取文件')
+  }
+
+  const pod = await findExecPodForApp(appName, clusterContext)
+  const response = await requestJsonWithAuthRetry(buildProxyUrl('/files/read'), clusterContext, {
+    method: 'POST',
+    body: JSON.stringify({
+      namespace: pod.namespace,
+      podName: pod.podName,
+      containerName: pod.containerName,
+      remotePath,
+    }),
+  })
+
+  return {
+    ...response,
+    content: base64ToText(response?.contentBase64 || ''),
+    podName: pod.podName,
+    containerName: pod.containerName,
+  }
+}
+
+export const saveFileToPod = async ({ appName, remotePath, content }, clusterContext) => {
+  if (!appName) {
+    throw new Error('缺少应用名，无法保存文件')
+  }
+  if (!remotePath) {
+    throw new Error('缺少文件路径，无法保存文件')
+  }
+
+  const pod = await findExecPodForApp(appName, clusterContext)
+  const response = await requestJsonWithAuthRetry(buildProxyUrl('/files/save'), clusterContext, {
+    method: 'POST',
+    body: JSON.stringify({
+      namespace: pod.namespace,
+      podName: pod.podName,
+      containerName: pod.containerName,
+      remotePath,
+      contentBase64: textToBase64(content),
+    }),
+  })
+
+  return {
+    ...response,
+    podName: pod.podName,
+    containerName: pod.containerName,
+  }
+}
+
 const randomFromCharset = (length, charset) =>
   Array.from({ length }, () => charset[Math.floor(Math.random() * charset.length)]).join('')
+
+const createDns1035Label = (length, tailCharset = '') => {
+  const safeLength = Math.max(1, Number(length) || 1)
+  const head = randomFromCharset(1, lowerAlpha)
+  if (safeLength === 1) return head
+  return `${head}${randomFromCharset(safeLength - 1, tailCharset || lowerAlnum)}`
+}
 
 const lowerAlnum = 'abcdefghijklmnopqrstuvwxyz0123456789'
 const lowerAlpha = 'abcdefghijklmnopqrstuvwxyz'
 const tokenCharset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 
-const createAppName = () => randomFromCharset(8, lowerAlnum)
+const createAppName = () => createDns1035Label(8, lowerAlnum)
 const createDomainPrefix = () => randomFromCharset(12, lowerAlpha)
 const createApiKey = () => randomFromCharset(64, tokenCharset)
 
-export const getCreateBlueprint = (clusterContext, hostConfig) => {
+export const getCreateBlueprint = (clusterContext, hostConfig, ingressList = []) => {
   const appName = createAppName()
   const domainPrefix = createDomainPrefix()
   const apiKey = createApiKey()
-  const rawRegionDomain =
-    sessionStorage.getItem('hermes-region-domain') ||
-    hostConfig?.cloud?.domain ||
-    hostConfig?.domain ||
-    'usw-1.sealos.app'
-  const regionDomain = String(rawRegionDomain || '').trim().replace(/\.sealos\.io$/i, '.sealos.app') || 'usw-1.sealos.app'
+  const ingressDomain = resolveIngressDomain(hostConfig, ingressList)
+
+  if (!ingressDomain) {
+    throw new Error('未解析到可用的公网域名后缀，请配置 VITE_DEFAULT_INGRESS_DOMAIN 或先提供一个已存在的可用 Ingress')
+  }
 
   return {
     appName,
     namespace: clusterContext.namespace,
     apiKey,
     domainPrefix,
-    fullDomain: `${domainPrefix}.${regionDomain}`,
+    fullDomain: `${domainPrefix}.${ingressDomain}`,
     image: 'nousresearch/hermes-agent:latest',
     state: 'Running',
     runtimeClassName: 'devbox-runtime',
